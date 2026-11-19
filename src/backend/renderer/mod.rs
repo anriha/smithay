@@ -325,6 +325,14 @@ pub trait Frame {
         )
     }
 
+    /// Announce which element is about to be drawn.
+    ///
+    /// Renderers that can choose a texture program per element use this to look
+    /// one up; backends that cannot keep the default implementation. Every element
+    /// that draws a texture calls this first, so a renderer never has to guess
+    /// identity from pixels.
+    fn begin_element(&mut self, _id: crate::backend::renderer::element::Id) {}
+
     /// Render part of a texture as given by src to the current target into the rectangle described by dst
     /// as a flat 2d-plane after applying the inverse of the given transformation.
     /// (Meaning `src_transform` should match the orientation of surface being rendered).

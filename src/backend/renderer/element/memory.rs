@@ -644,6 +644,8 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
+        frame.begin_element(self.id().clone());
+
         frame.render_texture_from_to(
             &self.texture,
             src,

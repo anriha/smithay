@@ -46,6 +46,7 @@ use super::{
     Bind, Blit, BlitFrame, Color32F, ContextId, DebugFlags, ExportMem, Frame, ImportDma, ImportMem,
     Offscreen, Renderer, RendererSuper, Texture, TextureFilter, TextureMapping, sync::SyncPoint,
 };
+use super::element::Id;
 use crate::{
     backend::{
         allocator::{
@@ -407,6 +408,9 @@ pub struct GlesRenderer {
     // frame defaults
     default_tex_program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
     solid_color_transform: Option<Box<dyn Fn(Color32F) -> Color32F>>,
+    /// Elements that are already in the target encoding; see
+    /// [`GlesRenderer::set_already_encoded_elements`].
+    already_encoded_elements: Vec<Id>,
 
     // caches
     buffers: Vec<GlesBuffer>,
@@ -441,6 +445,10 @@ pub struct GlesFrame<'frame, 'buffer> {
     transform: Transform,
     size: Size<i32, Physical>,
     tex_program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
+    /// Elements whose pixels are already in the target encoding.
+    already_encoded_elements: Vec<Id>,
+    /// Element announced by [`Frame::begin_element`] for the draw that follows.
+    current_element: Option<Id>,
     finished: AtomicBool,
 
     span: EnteredSpan,
@@ -748,6 +756,7 @@ impl GlesRenderer {
             solid_program,
             default_tex_program_override: None,
             solid_color_transform: None,
+            already_encoded_elements: Vec::new(),
             vbos,
             min_filter: TextureFilter::Linear,
             max_filter: TextureFilter::Linear,
@@ -2199,6 +2208,21 @@ impl GlesRenderer {
         self.default_tex_program_override = program_override;
     }
 
+    /// Sets which elements are already in the target encoding.
+    ///
+    /// Such an element is drawn with the built-in texture program, ignoring any
+    /// texture program override installed on the renderer or on the frame. A
+    /// compositor driving an output in an HDR encoding uses this for clients that
+    /// already output that encoding: running the conversion shader over their
+    /// pixels would encode them twice, which compresses the whole image towards
+    /// the reference white.
+    ///
+    /// The list is copied into every frame this renderer creates, including the
+    /// ones `DrmCompositor` creates internally, and is looked up per element.
+    pub fn set_already_encoded_elements(&mut self, elements: Vec<Id>) {
+        self.already_encoded_elements = elements;
+    }
+
     /// Sets a transform applied to every solid color drawn by this renderer, including
     /// [`Frame::clear`] and the colors of `SolidColorRenderElement`s.
     ///
@@ -2342,6 +2366,7 @@ impl Renderer for GlesRenderer {
         let span = span!(parent: &self.span, Level::DEBUG, "renderer_gles2_frame", current_projection = ?current_projection, size = ?output_size, transform = ?transform).entered();
 
         let tex_program_override = self.default_tex_program_override.clone();
+        let already_encoded_elements = self.already_encoded_elements.clone();
         Ok(GlesFrame {
             renderer: self,
             target,
@@ -2350,6 +2375,8 @@ impl Renderer for GlesRenderer {
             transform,
             size: output_size,
             tex_program_override,
+            already_encoded_elements,
+            current_element: None,
             finished: AtomicBool::new(false),
 
             span,
@@ -2530,6 +2557,10 @@ impl Frame for GlesFrame<'_, '_> {
         self.renderer.profiler.exit(&self.renderer.gl, scope);
 
         res
+    }
+
+    fn begin_element(&mut self, id: Id) {
+        self.current_element = Some(id);
     }
 
     #[instrument(level = "trace", skip(self), parent = &self.span)]
@@ -3010,10 +3041,21 @@ impl GlesFrame<'_, '_> {
         } else {
             ffi::TEXTURE_2D
         };
-        let (tex_program, additional_uniforms) = program
-            .map(|p| (p, additional_uniforms))
-            .or_else(|| self.tex_program_override.as_ref().map(|(p, a)| (p, &**a)))
-            .unwrap_or((&self.renderer.tex_program, &[]));
+        // The announced element may be already in the target encoding, in which
+        // case the conversion program must not touch it. Taken rather than read so
+        // an element that does not announce itself cannot inherit the previous one.
+        let announced = self.current_element.take();
+        let already_encoded = announced
+            .as_ref()
+            .is_some_and(|id| self.already_encoded_elements.iter().any(|known| known == id));
+        let (tex_program, additional_uniforms) = if already_encoded {
+            (&self.renderer.tex_program, &[][..])
+        } else {
+            program
+                .map(|p| (p, additional_uniforms))
+                .or_else(|| self.tex_program_override.as_ref().map(|(p, a)| (p, &**a)))
+                .unwrap_or((&self.renderer.tex_program, &[]))
+        };
         let program_variant = tex_program.variant_for_format(
             if !tex.0.is_external { tex.0.format } else { None },
             tex.0.has_alpha,

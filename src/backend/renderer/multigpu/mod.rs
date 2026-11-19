@@ -2070,6 +2070,12 @@ where
             .map_err(Error::Render)
     }
 
+    fn begin_element(&mut self, id: crate::backend::renderer::element::Id) {
+        if let Some(frame) = self.frame.as_mut() {
+            frame.begin_element(id);
+        }
+    }
+
     #[instrument(level = "trace", parent = &self.span, skip(self))]
     #[profiling::function]
     fn render_texture_from_to(

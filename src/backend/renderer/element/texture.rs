@@ -698,6 +698,8 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
+        frame.begin_element(self.id().clone());
+
         if frame.context_id() != self.context_id {
             warn!("trying to render texture from different renderer context");
             return Ok(());

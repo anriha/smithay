@@ -458,6 +458,8 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
+        frame.begin_element(self.id().clone());
+
         match self.texture {
             WaylandSurfaceTexture::Texture(ref texture) => frame.render_texture_from_to(
                 texture,
