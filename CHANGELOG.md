@@ -211,7 +211,9 @@ while using input handle methods that don't affect the grab.) As a result there 
 - The wp-color-representation-v1 protocol is now available in the
   `smithay::wayland::color::representation` module (`ColorRepresentationHandler` /
   `ColorRepresentationState`, routed with `delegate_dispatch2!`), letting clients declare the
-  coefficients, chroma location and alpha mode of their surface contents.
+  matrix coefficients and range, chroma location and alpha mode of their surface contents. The
+  bindings come from the staging XML shipped by `wayland-protocols`, so the wire format matches
+  what clients compile against.
 - `GlesRenderer::set_default_tex_program_override` and `GlesRenderer::set_solid_color_transform`
   (with the matching per-frame `GlesFrame::override_default_tex_program` /
   `set_tex_program_override`) let compositors apply color/tone-mapping shaders and transform solid
