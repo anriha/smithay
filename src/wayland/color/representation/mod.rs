@@ -20,17 +20,15 @@
 
 use std::sync::Mutex;
 
-use wayland_protocols::wp::color_representation::v1::server::{
-    wp_color_representation_manager_v1,
-    wp_color_representation_surface_v1::{self, WpColorRepresentationSurfaceV1},
+pub use wayland_protocols::wp::color_representation::v1::server::wp_color_representation_manager_v1;
+pub use wayland_protocols::wp::color_representation::v1::server::wp_color_representation_surface_v1::{
+    self, AlphaMode, ChromaLocation, Coefficients, Range, WpColorRepresentationSurfaceV1,
 };
 use wayland_server::{
     Dispatch, DisplayHandle, GlobalDispatch, Weak, protocol::wl_surface::WlSurface,
 };
 
 use crate::wayland::compositor::{self, Cacheable};
-
-pub use wp_color_representation_surface_v1::{AlphaMode, ChromaLocation, Coefficients, Range};
 
 mod dispatch;
 
