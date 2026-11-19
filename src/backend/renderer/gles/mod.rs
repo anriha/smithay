@@ -411,6 +411,9 @@ pub struct GlesRenderer {
     /// Elements that are already in the target encoding; see
     /// [`GlesRenderer::set_already_encoded_elements`].
     already_encoded_elements: Vec<Id>,
+    /// Per-element conversion programs; see
+    /// [`GlesRenderer::set_element_tex_programs`].
+    element_tex_programs: Vec<(Id, GlesTexProgram)>,
 
     // caches
     buffers: Vec<GlesBuffer>,
@@ -447,6 +450,8 @@ pub struct GlesFrame<'frame, 'buffer> {
     tex_program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
     /// Elements whose pixels are already in the target encoding.
     already_encoded_elements: Vec<Id>,
+    /// Per-element conversion programs, looked up by the announced element id.
+    element_tex_programs: Vec<(Id, GlesTexProgram)>,
     /// Element announced by [`Frame::begin_element`] for the draw that follows.
     current_element: Option<Id>,
     finished: AtomicBool,
@@ -757,6 +762,7 @@ impl GlesRenderer {
             default_tex_program_override: None,
             solid_color_transform: None,
             already_encoded_elements: Vec::new(),
+            element_tex_programs: Vec::new(),
             vbos,
             min_filter: TextureFilter::Linear,
             max_filter: TextureFilter::Linear,
@@ -2223,6 +2229,23 @@ impl GlesRenderer {
         self.already_encoded_elements = elements;
     }
 
+    /// Sets a conversion program for specific elements.
+    ///
+    /// The program replaces both the frame's default texture program and
+    /// [`GlesRenderer::set_default_tex_program_override`] for those elements only,
+    /// which is what a compositor needs when one frame holds elements encoded
+    /// differently from each other: an HDR frame can contain a linear-light
+    /// surface that must be encoded straight to PQ next to sRGB surfaces that the
+    /// frame default converts. Elements listed in
+    /// [`GlesRenderer::set_already_encoded_elements`] win over this: they are
+    /// copied, never converted.
+    ///
+    /// The list is copied into every frame this renderer creates and is looked up
+    /// per element, so it costs a scan of a list that is normally a handful long.
+    pub fn set_element_tex_programs(&mut self, programs: Vec<(Id, GlesTexProgram)>) {
+        self.element_tex_programs = programs;
+    }
+
     /// Sets a transform applied to every solid color drawn by this renderer, including
     /// [`Frame::clear`] and the colors of `SolidColorRenderElement`s.
     ///
@@ -2367,6 +2390,7 @@ impl Renderer for GlesRenderer {
 
         let tex_program_override = self.default_tex_program_override.clone();
         let already_encoded_elements = self.already_encoded_elements.clone();
+        let element_tex_programs = self.element_tex_programs.clone();
         Ok(GlesFrame {
             renderer: self,
             target,
@@ -2376,6 +2400,7 @@ impl Renderer for GlesRenderer {
             size: output_size,
             tex_program_override,
             already_encoded_elements,
+            element_tex_programs,
             current_element: None,
             finished: AtomicBool::new(false),
 
@@ -3048,8 +3073,18 @@ impl GlesFrame<'_, '_> {
         let already_encoded = announced
             .as_ref()
             .is_some_and(|id| self.already_encoded_elements.iter().any(|known| known == id));
+        // An element may need a conversion program of its own, e.g. a linear-light
+        // surface composited into an HDR frame next to sRGB ones.
+        let element_program = announced.as_ref().and_then(|id| {
+            self.element_tex_programs
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, program)| program)
+        });
         let (tex_program, additional_uniforms) = if already_encoded {
             (&self.renderer.tex_program, &[][..])
+        } else if let Some(element_program) = element_program {
+            (element_program, &[][..])
         } else {
             program
                 .map(|p| (p, additional_uniforms))
