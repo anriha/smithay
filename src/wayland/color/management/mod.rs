@@ -679,6 +679,7 @@ impl ColorManagementState {
     /// description when this is called.
     pub fn output_description_changed(&mut self, output: &Output) {
         self.output_objects.retain(|obj| obj.is_alive());
+        let mut changed = false;
         for obj in &self.output_objects {
             let same_output = obj
                 .data::<WlOutput>()
@@ -686,7 +687,17 @@ impl ColorManagementState {
                 .is_some_and(|o| o == *output);
             if same_output {
                 obj.image_description_changed();
+                changed = true;
             }
+        }
+
+        // The protocol requires every event that changes what a client learns about
+        // an output to be followed by wl_output.done, and clients latch on it: an
+        // event without the companion leaves them holding the old description until
+        // something unrelated changes. Nothing about mode, scale or geometry moved
+        // here, so this only sends the done events, xdg_output's first.
+        if changed {
+            output.wl_change_current_state(None, None, None, None);
         }
     }
 }
