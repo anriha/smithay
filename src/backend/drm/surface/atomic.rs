@@ -1031,16 +1031,6 @@ impl AtomicDrmSurface {
             return Ok(());
         }
 
-        let destroy_blob = |blob: property::Value<'static>| {
-            if let property::Value::Blob(id) = blob {
-                if id != 0 {
-                    if let Err(err) = self.fd.destroy_property_blob(id) {
-                        warn!("Failed to destroy HDR metadata property blob: {}", err);
-                    }
-                }
-            }
-        };
-
         let hdr_blob = match color_state.hdr_metadata {
             Some(meta) => self
                 .fd
@@ -1065,7 +1055,7 @@ impl AtomicDrmSurface {
         ) {
             Ok(resolved) => resolved,
             Err(err) => {
-                destroy_blob(hdr_blob);
+                self.destroy_blob(hdr_blob);
                 return Err(err);
             }
         };
@@ -1107,7 +1097,7 @@ impl AtomicDrmSurface {
         })();
 
         if let Err(err) = res {
-            destroy_blob(hdr_blob);
+            self.destroy_blob(hdr_blob);
             return Err(err);
         }
 
@@ -1115,7 +1105,7 @@ impl AtomicDrmSurface {
         // (referenced by the current state) is destroyed by `commit` once it is replaced.
         let old_blob = std::mem::replace(&mut pending.resolved_color.hdr_blob, property::Value::Blob(0));
         if old_blob != current.resolved_color.hdr_blob {
-            destroy_blob(old_blob);
+            self.destroy_blob(old_blob);
         }
 
         pending.color_state = color_state;
@@ -1249,27 +1239,12 @@ impl AtomicDrmSurface {
                 warn!("New screen configuration invalid!:\n\t{:?}\n\t{}\n", req, err);
 
                 return Err(Error::TestFailed(self.crtc));
-            } else {
-                if current.mode != pending.mode {
-                    if let Err(err) = self.fd.destroy_property_blob(current.blob.into()) {
-                        warn!("Failed to destroy old mode property blob: {}", err);
-                    }
-                }
-                // Like the mode blob: once the property moves off the old metadata blob, the
-                // kernel keeps it alive as long as needed, so it's safe to release it now.
-                if current.resolved_color.hdr_blob != pending.resolved_color.hdr_blob {
-                    if let property::Value::Blob(id) = current.resolved_color.hdr_blob {
-                        if id != 0 {
-                            if let Err(err) = self.fd.destroy_property_blob(id) {
-                                warn!("Failed to destroy old HDR metadata property blob: {}", err);
-                            }
-                        }
-                    }
-                }
-
-                // new config
-                req
             }
+
+            // The blobs `current` still holds are released only once the real commit below
+            // succeeded (see after the commit): releasing them here would leave `current`
+            // with a destroyed blob id if that commit failed.
+            req
         };
 
         debug!("Setting screen: {:?}", req);
@@ -1301,6 +1276,15 @@ impl AtomicDrmSurface {
             });
 
         if result.is_ok() {
+            // The commit now owns the pending blobs and the kernel has moved off the current
+            // ones, so the replaced mode and HDR metadata blobs can be released.
+            if current.mode != pending.mode {
+                self.destroy_blob(current.blob);
+            }
+            if current.resolved_color.hdr_blob != pending.resolved_color.hdr_blob {
+                self.destroy_blob(current.resolved_color.hdr_blob);
+            }
+
             *current = pending.clone();
             for plane in planes.iter() {
                 if plane.config.is_some() {
@@ -1448,7 +1432,24 @@ impl AtomicDrmSurface {
 
         if res.is_ok() {
             self.used_planes.lock().unwrap().clear();
-            self.state.write().unwrap().clear();
+            let mut state = self.state.write().unwrap();
+            let mut pending = self.pending.write().unwrap();
+            // The reset commit released the metadata blob the kernel was signalling, so the
+            // blobs this surface owns can go now. After a successful commit current and
+            // pending share one id; pending can also hold a blob that was staged but never
+            // committed, which must be released as well or it leaks until the device closes.
+            let current_blob =
+                std::mem::replace(&mut state.resolved_color.hdr_blob, property::Value::Blob(0));
+            let pending_blob =
+                std::mem::replace(&mut pending.resolved_color.hdr_blob, property::Value::Blob(0));
+            state.clear();
+            std::mem::drop(pending);
+            std::mem::drop(state);
+
+            self.destroy_blob(current_blob);
+            if pending_blob != current_blob {
+                self.destroy_blob(pending_blob);
+            }
         }
 
         res
@@ -1458,11 +1459,17 @@ impl AtomicDrmSurface {
         &self,
         fd: Option<&B>,
     ) -> Result<(), Error> {
-        *self.state.write().unwrap() = if let Some(fd) = fd {
+        let new_state = if let Some(fd) = fd {
             State::current_state(fd, self.crtc, &mut self.prop_mapping.write().unwrap())?
         } else {
             State::current_state(&*self.fd, self.crtc, &mut self.prop_mapping.write().unwrap())?
         };
+        // The re-read state never owns the metadata blob that is currently signalled, so the
+        // blob the old state owned is ours to release once the pending state has been
+        // re-created below (a successful commit leaves current and pending sharing one id).
+        let old_current_blob = std::mem::replace(&mut *self.state.write().unwrap(), new_state)
+            .resolved_color
+            .hdr_blob;
 
         // Re-initialize the mode blob which might got lost after suspend/resume
         let mut pending = self.pending.write().unwrap();
@@ -1480,6 +1487,7 @@ impl AtomicDrmSurface {
         // Re-initialize the HDR metadata blob, which might have gotten lost after
         // suspend/resume; the pending color state then re-asserts itself on the next commit,
         // since the re-read current state reflects whatever survived.
+        let mut old_pending_blob = property::Value::Blob(0);
         if let Some(meta) = pending.color_state.hdr_metadata {
             let hdr_blob = self
                 .fd
@@ -1491,15 +1499,31 @@ impl AtomicDrmSurface {
                         source,
                     })
                 })?;
-            let old_blob = std::mem::replace(&mut pending.resolved_color.hdr_blob, hdr_blob);
-            if let property::Value::Blob(id) = old_blob {
-                if id != 0 {
-                    let _ = self.fd.destroy_property_blob(id);
-                }
-            }
+            old_pending_blob = std::mem::replace(&mut pending.resolved_color.hdr_blob, hdr_blob);
+        }
+        std::mem::drop(pending);
+
+        self.destroy_blob(old_pending_blob);
+        if old_current_blob != old_pending_blob {
+            self.destroy_blob(old_current_blob);
         }
 
         Ok(())
+    }
+
+    /// Destroys a property blob this surface created, if `blob` holds a non-zero blob id.
+    ///
+    /// The kernel keeps a property blob alive while a committed state references it, so this
+    /// must only be called once the kernel has moved off the blob (after the commit that
+    /// replaced it succeeded, or when the surface state was reset).
+    fn destroy_blob(&self, blob: property::Value<'static>) {
+        if let property::Value::Blob(id) = blob {
+            if id != 0 {
+                if let Err(err) = self.fd.destroy_property_blob(id) {
+                    warn!("Failed to destroy property blob: {}", err);
+                }
+            }
+        }
     }
 
     pub(crate) fn device_fd(&self) -> &DrmDeviceFd {
