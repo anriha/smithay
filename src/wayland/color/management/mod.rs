@@ -415,12 +415,37 @@ struct ColorManagementSurfaceData {
     last_preferred: Mutex<Option<u32>>,
 }
 
+/// The request that created a `wp_image_description_v1`, as far as the protocol cares: only
+/// descriptions that come from an output or a surface feedback object may be queried with
+/// `get_information`, while every description created by a `wp_image_description_creator_*`
+/// object must reject it with the `no_information` error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptionOrigin {
+    /// Created by `wp_image_description_creator_params_v1.create`,
+    /// `wp_color_manager_v1.create_windows_scrgb` or `create_windows_bt2100`. These describe
+    /// content the client itself authored, so the compositor owes no information about them.
+    Creator,
+    /// Created by `wp_color_management_output_v1.get_image_description` or
+    /// `wp_color_management_surface_feedback_v1.get_preferred{,_parametric}`; these describe
+    /// state of the compositor, which the client is entitled to inspect.
+    Compositor,
+}
+
+impl DescriptionOrigin {
+    /// Whether objects of this origin may answer `get_information`.
+    pub fn allows_information(self) -> bool {
+        matches!(self, DescriptionOrigin::Compositor)
+    }
+}
+
 /// User data of a `wp_image_description_v1`: the parsed description it represents.
 #[derive(Debug)]
 pub struct ImageDescriptionData {
     /// `None` for objects that got the `failed` event instead of `ready`; those can only be
     /// destroyed.
     desc: Option<ImageDescription>,
+    /// The request that created this object; decides whether `get_information` is allowed.
+    origin: DescriptionOrigin,
 }
 
 impl ImageDescriptionData {
@@ -827,6 +852,7 @@ where
                     state,
                     image_description,
                     ImageDescription::WINDOWS_SCRGB,
+                    DescriptionOrigin::Creator,
                     data_init,
                 );
             }
@@ -846,6 +872,7 @@ where
                     state,
                     image_description,
                     ImageDescription::WINDOWS_BT2100,
+                    DescriptionOrigin::Creator,
                     data_init,
                 );
             }
@@ -857,6 +884,7 @@ where
                 // know about.
                 make_failed_description(
                     image_description,
+                    wp_image_description_v1::Cause::Unsupported,
                     "image description references are not supported",
                     data_init,
                 );
@@ -885,10 +913,28 @@ where
         use wp_color_management_output_v1::Request;
         match request {
             Request::GetImageDescription { image_description } => {
-                let desc = Output::from_resource(self)
-                    .map(|output| state.description_for_output(&output))
-                    .unwrap_or(ImageDescription::SRGB);
-                make_ready_description(state, image_description, desc, data_init);
+                // An inert object (the output is gone, e.g. after a hotplug while the client
+                // kept the wp_color_management_output_v1) must fail with `no_output`; there is
+                // no description to hand out, and silently reporting sRGB would tell the client
+                // its content is shown on an SDR output that no longer exists.
+                match Output::from_resource(self) {
+                    Some(output) => {
+                        let desc = state.description_for_output(&output);
+                        make_ready_description(
+                            state,
+                            image_description,
+                            desc,
+                            DescriptionOrigin::Compositor,
+                            data_init,
+                        );
+                    }
+                    None => make_failed_description(
+                        image_description,
+                        wp_image_description_v1::Cause::NoOutput,
+                        "the output no longer exists",
+                        data_init,
+                    ),
+                }
             }
             Request::Destroy => {}
             _ => {}
@@ -1051,7 +1097,13 @@ where
                     return;
                 };
                 let desc = state.preferred_description_for_surface(&surface);
-                make_ready_description(state, image_description, desc, data_init);
+                make_ready_description(
+                    state,
+                    image_description,
+                    desc,
+                    DescriptionOrigin::Compositor,
+                    data_init,
+                );
             }
             Request::Destroy => {}
             _ => {}
@@ -1301,6 +1353,7 @@ where
                     if exceeds_gamut || exceeds_luminance {
                         make_failed_description(
                             image_description,
+                            wp_image_description_v1::Cause::Unsupported,
                             "target color volume exceeds the primary color volume \
                              (extended_target_volume is not supported)",
                             data_init,
@@ -1309,7 +1362,13 @@ where
                     }
                 }
 
-                make_ready_description(state, image_description, desc, data_init);
+                make_ready_description(
+                    state,
+                    image_description,
+                    desc,
+                    DescriptionOrigin::Creator,
+                    data_init,
+                );
             }
             _ => {}
         }
@@ -1341,9 +1400,12 @@ where
                     );
                     return;
                 };
-                // The protocol forbids get_information on descriptions from
-                // create_windows_scrgb and create_windows_bt2100.
-                if desc.windows_scrgb || desc.windows_bt2100 {
+                // Whether get_information is allowed is decided by the request that created
+                // the object, not by the description it carries: descriptions created by a
+                // creator (parametric, ICC or the Windows creators) must reject it, while
+                // output and preferred descriptions must always allow it — even though
+                // `description_for_output` may hand out a Windows description.
+                if !self.origin.allows_information() {
                     resource.post_error(
                         wp_image_description_v1::Error::NoInformation,
                         "this image description does not allow get_information",
@@ -1384,12 +1446,19 @@ fn make_ready_description<D>(
     state: &mut D,
     image_description: New<WpImageDescriptionV1>,
     desc: ImageDescription,
+    origin: DescriptionOrigin,
     data_init: &mut DataInit<'_, D>,
 ) where
     D: Dispatch<WpImageDescriptionV1, ImageDescriptionData> + ColorManagementHandler + 'static,
 {
     let identity = state.color_management_state().identity_for(desc);
-    let image = data_init.init(image_description, ImageDescriptionData { desc: Some(desc) });
+    let image = data_init.init(
+        image_description,
+        ImageDescriptionData {
+            desc: Some(desc),
+            origin,
+        },
+    );
     if image.version() >= 2 {
         // Identities are never recycled (the table grows monotonically), as ready2 requires.
         image.ready2(0, identity);
@@ -1398,17 +1467,26 @@ fn make_ready_description<D>(
     }
 }
 
-/// Initializes a `wp_image_description_v1` that immediately fails gracefully with the
-/// `unsupported` cause; the object never becomes ready and can only be destroyed.
+/// Initializes a `wp_image_description_v1` that immediately fails gracefully with `cause`; the
+/// object never becomes ready and can only be destroyed.
 fn make_failed_description<D>(
     image_description: New<WpImageDescriptionV1>,
+    cause: wp_image_description_v1::Cause,
     msg: &str,
     data_init: &mut DataInit<'_, D>,
 ) where
     D: Dispatch<WpImageDescriptionV1, ImageDescriptionData> + 'static,
 {
-    let image = data_init.init(image_description, ImageDescriptionData { desc: None });
-    image.failed(wp_image_description_v1::Cause::Unsupported, msg.into());
+    let image = data_init.init(
+        image_description,
+        ImageDescriptionData {
+            desc: None,
+            // Irrelevant for a failed object: it never becomes ready, so it can never be
+            // queried.
+            origin: DescriptionOrigin::Creator,
+        },
+    );
+    image.failed(cause, msg.into());
 }
 
 #[cfg(test)]
