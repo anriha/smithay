@@ -1027,7 +1027,12 @@ impl AtomicDrmSurface {
 
         let current = self.state.read().unwrap();
         let mut pending = self.pending.write().unwrap();
-        if pending.color_state == color_state {
+        // The pending state also has to own the blob its metadata describes. A reset can
+        // drop that blob (`clear_state`) while `pending.color_state` still claims PQ, and
+        // an early return here would then leave the connector in SDR with no way to notice.
+        let pending_has_blob = !matches!(&pending.resolved_color.hdr_blob, property::Value::Blob(0));
+        let blob_matches = color_state.hdr_metadata.is_some() == pending_has_blob;
+        if pending.color_state == color_state && blob_matches {
             return Ok(());
         }
 
@@ -1443,6 +1448,14 @@ impl AtomicDrmSurface {
             let pending_blob =
                 std::mem::replace(&mut pending.resolved_color.hdr_blob, property::Value::Blob(0));
             state.clear();
+            // The reset commit put the connector's colour properties back to the kernel
+            // defaults, so the pending state has to describe the same thing. Leaving
+            // `color_state` at PQ while its blob was gone made `use_color_state` a no-op
+            // for the next identical request (it compares the state, not the blob) and the
+            // commit that re-enabled the connector after a wake carried BT.2020 without HDR
+            // metadata: the compositor still converted to PQ and the panel stayed in SDR.
+            pending.color_state = ConnectorColorState::default();
+            pending.resolved_color = ResolvedColorState::default();
             std::mem::drop(pending);
             std::mem::drop(state);
 
