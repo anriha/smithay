@@ -1456,6 +1456,11 @@ impl AtomicDrmSurface {
             // metadata: the compositor still converted to PQ and the panel stayed in SDR.
             pending.color_state = ConnectorColorState::default();
             pending.resolved_color = ResolvedColorState::default();
+            // `reset_crtc` also turned `VRR_ENABLED` off. Leaving `pending.vrr` set kept
+            // `vrr_enabled` reporting adaptive sync the CRTC no longer had, and made
+            // `use_vrr` a no-op for the next identical request, so a surface that was
+            // cleared never signalled adaptive sync again.
+            pending.vrr = false;
             std::mem::drop(pending);
             std::mem::drop(state);
 
